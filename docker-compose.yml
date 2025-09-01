@@ -1,0 +1,119 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  # MySQL数据库
+  mysql:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: 123456
+      MYSQL_DATABASE: platform
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql  # 添加初始化脚本
+    networks:
+      - platform-network
+    command: --default-authentication-plugin=mysql_native_password
+
+  # Redis缓存
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - platform-network
+
+  # API网关
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      - mysql
+      - redis
+      - auth-service
+      - user-service
+      - payment-service
+      - backstage-service
+    networks:
+      - platform-network
+
+  # 认证服务
+  auth-service:
+    build: ./auth-service
+    ports:
+      - "8081:8081"
+    depends_on:
+      - mysql
+      - redis
+    environment:
+      DB_HOST: mysql
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_NAME: platform
+      REDIS_HOST: redis
+      JWT_SECRET: your_jwt_secret_key_here
+    networks:
+      - platform-network
+    restart: on-failure  # 添加重启策略，等待数据库就绪
+
+  # 用户服务
+  user-service:
+    build: ./user-service
+    ports:
+      - "8082:8082"
+    depends_on:
+      - mysql
+    environment:
+      DB_HOST: mysql
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_NAME: platform
+    networks:
+      - platform-network
+    restart: on-failure
+
+  # 支付服务
+  payment-service:
+    build: ./payment-service
+    ports:
+      - "8083:8083"
+    depends_on:
+      - mysql
+      - redis
+    environment:
+      DB_HOST: mysql
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_NAME: platform
+      REDIS_HOST: redis
+    networks:
+      - platform-network
+    restart: on-failure
+
+  # 后台服务
+  backstage-service:
+    build: ./backstage-service
+    ports:
+      - "8084:8084"
+    depends_on:
+      - mysql
+    environment:
+      DB_HOST: mysql
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_NAME: platform
+    networks:
+      - platform-network
+    restart: on-failure
+
+volumes:
+  mysql_data:
+
+networks:
+  platform-network:
+    driver: bridge
