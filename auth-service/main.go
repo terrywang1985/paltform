@@ -18,9 +18,12 @@ var jwtSecret = []byte(os.Getenv("JWT_SECRET"))
 
 type User struct {
 	ID           uint   `gorm:"primaryKey"`
-	Username     string `gorm:"uniqueIndex"`
+	Username     string `gorm:"type:varchar(100);uniqueIndex"`
 	PasswordHash string
-	Email        string `gorm:"uniqueIndex"`
+	Email        string `gorm:"type:varchar(255);uniqueIndex"`
+	FirstName    string `gorm:"type:varchar(100)"`
+	LastName     string `gorm:"type:varchar(100)"`
+	Avatar       string `gorm:"type:varchar(255)"`
 	CreatedAt    time.Time
 	UpdatedAt    time.Time
 }
