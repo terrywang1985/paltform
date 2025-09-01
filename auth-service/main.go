@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	jwt "github.com/golang-jwt/jwt/v4" // 确保这一行存在
 	"golang.org/x/crypto/bcrypt"
 	"shared/database"
 )

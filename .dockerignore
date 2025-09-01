@@ -1,0 +1,10 @@
+**/.git
+**/node_modules
+**/.DS_Store
+**/*.log
+**/tmp
+**/bin
+**/vendor
+go.work.sum
+**/*.bat
+go.work
