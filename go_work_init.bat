@@ -1,4 +1,5 @@
 go work init
+go work use ./api-gateway
 go work use ./auth-service
 go work use ./user-service
 go work use ./payment-service

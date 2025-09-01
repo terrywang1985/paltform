@@ -1,14 +1,13 @@
 // api-gateway/main.go
+
 package main
 
 import (
+	"github.com/gin-gonic/gin"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
-	"strings"
-
-	"github.com/gin-gonic/gin"
 )
 
 func main() {

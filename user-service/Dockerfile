@@ -8,6 +8,7 @@ COPY . .
 
 # 启用 Go workspace
 RUN go work init
+RUN go work use ./api-gateway
 RUN go work use ./auth-service
 RUN go work use ./user-service
 RUN go work use ./payment-service

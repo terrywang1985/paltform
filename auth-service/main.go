@@ -1,3 +1,5 @@
+// 带路径的文件名
+// auth-service/main.go
 package main
 
 import (
