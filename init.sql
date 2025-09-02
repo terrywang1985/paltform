@@ -6,17 +6,23 @@ USE platform;
 -- 用户表
 CREATE TABLE IF NOT EXISTS users (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    openid CHAR(36) UNIQUE NOT NULL,
     username VARCHAR(100) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     email VARCHAR(255) UNIQUE NOT NULL,
+    phone VARCHAR(20),
+    country_code VARCHAR(5) DEFAULT '+86',
+    phone_verified BOOLEAN DEFAULT FALSE,
     first_name VARCHAR(100),
     last_name VARCHAR(100),
     avatar VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     INDEX idx_username (username),
-    INDEX idx_email (email)
-);
+    INDEX idx_email (email),
+    INDEX idx_phone_country (country_code, phone),
+    INDEX idx_openid (openid)
+    );
 
 -- 支付记录表
 CREATE TABLE IF NOT EXISTS payments (

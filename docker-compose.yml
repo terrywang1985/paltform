@@ -41,7 +41,7 @@ services:
       DB_USER: user
       DB_PASSWORD: password
       DB_NAME: platform
-      REDIS_HOST: redis
+      REDIS_HOST: redis:6379
       JWT_SECRET: your_jwt_secret_key_here
     networks:
       - platform-network
@@ -80,7 +80,7 @@ services:
       DB_USER: user
       DB_PASSWORD: password
       DB_NAME: platform
-      REDIS_HOST: redis
+      REDIS_HOST: redis:6379
     networks:
       - platform-network
     restart: on-failure
