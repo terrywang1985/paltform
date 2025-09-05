@@ -1,4 +1,4 @@
-# paltform
+# platform
 user platform
 
 #启动
