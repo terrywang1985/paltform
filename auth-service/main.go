@@ -176,7 +176,6 @@ func main() {
 			"token":   token,
 			"openid":  user.OpenID,
 			"user": gin.H{
-				"id":       user.ID,
 				"username": user.Username,
 				"email":    user.Email,
 			},
@@ -218,7 +217,6 @@ func main() {
 			"token":   token,
 			"openid":  user.OpenID,
 			"user": gin.H{
-				"id":       user.ID,
 				"username": user.Username,
 				"email":    user.Email,
 			},
