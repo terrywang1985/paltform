@@ -13,6 +13,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -23,30 +24,24 @@ import (
 )
 
 var jwtSecret = []byte(os.Getenv("JWT_SECRET"))
-var internalSharedToken = os.Getenv("SHARED_INTERNAL_TOKEN") // 给游戏服/后端调用的共享密钥
+var internalSharedToken = os.Getenv("SHARED_INTERNAL_TOKEN")
 
 // ===== Models =====
 type User struct {
-	ID            uint   `gorm:"primaryKey"`
-	OpenID        string `gorm:"type:char(36);uniqueIndex"`
-	Username      string `gorm:"type:varchar(100);uniqueIndex"`
-	PasswordHash  string
-	Email         string `gorm:"type:varchar(255);uniqueIndex"`
-	CountryCode   string `gorm:"type:varchar(5);default:'+86'"`
-	Phone         string `gorm:"type:varchar(20)"`
-	PhoneVerified bool   `gorm:"default:false"`
-	FirstName     string `gorm:"type:varchar(100)"`
-	LastName      string `gorm:"type:varchar(100)"`
-	Avatar        string `gorm:"type:varchar(255)"`
+	ID            uint    `gorm:"primaryKey"`
+	OpenID        string  `gorm:"column:openid;type:char(36);uniqueIndex"`
+	Username      string  `gorm:"type:varchar(100);uniqueIndex"`
+	PasswordHash  string  `gorm:"column:password_hash"`
+	Email         *string `gorm:"type:varchar(255);uniqueIndex"` // 使用指针类型
+	CountryCode   string  `gorm:"type:varchar(5);default:'+86'"`
+	Phone         string  `gorm:"type:varchar(20)"`
+	PhoneVerified bool    `gorm:"default:false"`
+	EmailVerified bool    `gorm:"default:false"`
+	FirstName     string  `gorm:"type:varchar(100)"`
+	LastName      string  `gorm:"type:varchar(100)"`
+	Avatar        string  `gorm:"type:varchar(255)"`
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
-}
-
-type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
-	AppID    string `json:"app_id" binding:"required"`
-	DeviceID string `json:"device_id"` // 可选：用于日志/定位
 }
 
 type RegisterRequest struct {
@@ -54,6 +49,24 @@ type RegisterRequest struct {
 	Password string `json:"password" binding:"required"`
 	Email    string `json:"email" binding:"required,email"`
 	AppID    string `json:"app_id" binding:"required"`
+}
+
+type VerifyEmailRequest struct {
+	Email string `json:"email" binding:"required,email"`
+	Code  string `json:"code" binding:"required"`
+	AppID string `json:"app_id" binding:"required"`
+}
+
+type ResendCodeRequest struct {
+	Email string `json:"email" binding:"required,email"`
+	AppID string `json:"app_id" binding:"required"`
+}
+
+type LoginRequest struct {
+	Username string `json:"username" binding:"required"`
+	Password string `json:"password" binding:"required"`
+	AppID    string `json:"app_id" binding:"required"`
+	DeviceID string `json:"device_id"`
 }
 
 type SMSRequest struct {
@@ -71,9 +84,8 @@ type PhoneLoginRequest struct {
 	DeviceID    string `json:"device_id"`
 }
 
-// 登出请求
 type LogoutRequest struct {
-	LogoutAll bool `json:"logout_all"` // 是否登出所有设备
+	LogoutAll bool `json:"logout_all"`
 }
 
 type CheckTokenRequest struct {
@@ -82,18 +94,31 @@ type CheckTokenRequest struct {
 }
 
 type KickRequest struct {
-	OpenID string `json:"openid"`  // openid 与 user_id 任选其一
-	UserID *uint  `json:"user_id"` // 可选
+	OpenID string `json:"openid"`
+	UserID *uint  `json:"user_id"`
 	AppID  string `json:"app_id" binding:"required"`
-	Reason string `json:"reason"` // 可选
+	Reason string `json:"reason"`
 }
 
 // ===== Keys in Redis =====
 func tokenBlacklistKey(jti string) string {
 	return "token:blacklist:" + jti
 }
+
 func currentSessionKey(appID string, userID uint) string {
 	return fmt.Sprintf("session:current:%s:%d", appID, userID)
+}
+
+func emailVerificationKey(email string) string {
+	return "email:verify:" + email
+}
+
+func emailRateLimitKey(email string) string {
+	return "email:rate:" + email
+}
+
+func registrationDataKey(email string) string {
+	return "reg:data:" + email
 }
 
 // ===== Main =====
@@ -121,55 +146,196 @@ func main() {
 
 	r := gin.Default()
 
-	// 注册
-	r.POST("/register", func(c *gin.Context) {
+	// 发送邮箱验证码
+	r.POST("/register/send-code", func(c *gin.Context) {
 		var req RegisterRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
 		}
+
+		// 验证邮箱格式
+		if !isValidEmail(req.Email) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "邮箱格式不正确"})
+			return
+		}
+
+		// 检查用户名是否已存在
 		var existing User
 		if result := db.Where("username = ?", req.Username).First(&existing); result.Error == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "用户名已存在"})
 			return
 		}
+
+		// 检查邮箱是否已存在（非NULL值）
 		if result := db.Where("email = ?", req.Email).First(&existing); result.Error == nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "邮箱已存在"})
 			return
 		}
 
-		hash, err := hashPassword(req.Password)
+		// 检查发送频率限制
+		if isEmailRateLimited(req.Email) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
+			return
+		}
+
+		// 生成验证码
+		code := generateSMSCode()
+
+		// 存储验证码到Redis，有效期10分钟
+		if err := storeEmailVerificationCode(req.Email, code, 10*time.Minute); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "发送验证码失败"})
+			return
+		}
+
+		// 存储注册数据到Redis，有效期10分钟
+		regData := RegistrationData{
+			Username: req.Username,
+			Password: req.Password,
+			AppID:    req.AppID,
+		}
+		if err := storeRegistrationData(req.Email, regData, 10*time.Minute); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "保存注册信息失败"})
+			return
+		}
+
+		// 设置频率限制
+		setEmailRateLimit(req.Email, time.Minute)
+
+		// 发送验证码到邮箱
+		go sendVerificationEmail(req.Email, code)
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":    "验证码已发送",
+			"expires_in": 600,
+			"email":      req.Email,
+			"username":   req.Username,
+		})
+	})
+
+	// 重新发送验证码
+	r.POST("/register/resend-code", func(c *gin.Context) {
+		var req ResendCodeRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		// 检查发送频率限制
+		if isEmailRateLimited(req.Email) {
+			c.JSON(http.StatusTooManyRequests, gin.H{"error": "请求过于频繁，请稍后再试"})
+			return
+		}
+
+		// 检查是否有注册数据
+		_, err := getRegistrationData(req.Email)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请先开始注册流程"})
+			return
+		}
+
+		// 生成新的验证码
+		code := generateSMSCode()
+
+		// 存储验证码到Redis
+		if err := storeEmailVerificationCode(req.Email, code, 10*time.Minute); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "发送验证码失败"})
+			return
+		}
+
+		// 设置频率限制
+		setEmailRateLimit(req.Email, time.Minute)
+
+		// 发送验证码到邮箱
+		go sendVerificationEmail(req.Email, code)
+
+		c.JSON(http.StatusOK, gin.H{
+			"message":    "验证码已重新发送",
+			"expires_in": 600,
+			"email":      req.Email,
+		})
+	})
+
+	// 验证邮箱并完成注册
+	r.POST("/register/verify", func(c *gin.Context) {
+		var req VerifyEmailRequest
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+
+		// 验证验证码
+		valid, err := validateEmailVerificationCode(req.Email, req.Code)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "验证码验证失败"})
+			return
+		}
+
+		if !valid {
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "验证码错误或已过期"})
+			return
+		}
+
+		// 从Redis获取注册信息
+		regData, err := getRegistrationData(req.Email)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "注册信息已过期，请重新开始"})
+			return
+		}
+
+		// 再次检查用户名是否已被使用
+		var existing User
+		if result := db.Where("username = ?", regData.Username).First(&existing); result.Error == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "用户名已存在"})
+			return
+		}
+
+		// 再次检查邮箱是否已被使用（非NULL值）
+		if result := db.Where("email = ?", req.Email).First(&existing); result.Error == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "邮箱已存在"})
+			return
+		}
+
+		// 创建用户
+		hash, err := hashPassword(regData.Password)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "密码加密失败"})
 			return
 		}
 
 		uid := uuid.NewString()
+		email := req.Email // 创建局部变量保存邮箱
 		user := User{
-			OpenID:       uid,
-			Username:     req.Username,
-			PasswordHash: hash,
-			Email:        req.Email,
-			CreatedAt:    time.Now(),
-			UpdatedAt:    time.Now(),
+			OpenID:        uid,
+			Username:      regData.Username,
+			PasswordHash:  hash,
+			Email:         &email, // 使用指针
+			EmailVerified: true,
+			CreatedAt:     time.Now(),
+			UpdatedAt:     time.Now(),
 		}
+
 		if result := db.Create(&user); result.Error != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建用户失败"})
 			return
 		}
 
-		// 单点登录：创建 session_id 并写入 Redis
+		// 创建会话
 		sessionID := uuid.NewString()
-		if err := setCurrentSession(c, req.AppID, user.ID, sessionID, time.Hour*24*7); err != nil {
+		if err := setCurrentSession(c, regData.AppID, user.ID, sessionID, time.Hour*24*7); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "创建会话失败"})
 			return
 		}
 
-		token, jti, err := generateJWT(user, req.AppID, sessionID)
+		// 生成JWT令牌
+		token, jti, err := generateJWT(user, regData.AppID, sessionID)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "生成令牌失败"})
 			return
 		}
+
+		// 清理注册数据
+		clearRegistrationData(req.Email)
 
 		c.JSON(http.StatusOK, gin.H{
 			"message": "注册成功",
@@ -177,7 +343,7 @@ func main() {
 			"openid":  user.OpenID,
 			"user": gin.H{
 				"username": user.Username,
-				"email":    user.Email,
+				"email":    *user.Email, // 解引用指针
 			},
 			"jti": jti,
 		})
@@ -212,23 +378,29 @@ func main() {
 			return
 		}
 
-		c.JSON(http.StatusOK, gin.H{
+		response := gin.H{
 			"message": "登录成功",
 			"token":   token,
 			"openid":  user.OpenID,
 			"user": gin.H{
 				"username": user.Username,
-				"email":    user.Email,
 			},
 			"jti": jti,
-		})
+		}
+
+		// 如果有邮箱，添加到响应中
+		if user.Email != nil {
+			response["user"].(gin.H)["email"] = *user.Email
+		}
+
+		c.JSON(http.StatusOK, response)
 	})
 
-	// 短信
+	// 短信相关接口
 	r.POST("/phone/send-code", sendSMSHandler(db))
 	r.POST("/phone/login", phoneLoginHandler(db))
 
-	// 客户端验证令牌（简单版）
+	// 客户端验证令牌
 	r.POST("/verify", func(c *gin.Context) {
 		tokenString, ok := extractBearer(c)
 		if !ok {
@@ -240,21 +412,28 @@ func main() {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "无效令牌"})
 			return
 		}
-		// 黑名单 & 单点登录检查
 		if ok := isTokenUsable(c, claims); !ok {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "令牌已失效"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
+
+		response := gin.H{
 			"valid":    true,
 			"user_id":  claims["user_id"],
 			"username": claims["username"],
 			"openid":   claims["sub"],
 			"app_id":   claims["app_id"],
-		})
+		}
+
+		// 如果JWT中有email声明，添加到响应中
+		if email, exists := claims["email"]; exists && email != nil {
+			response["email"] = email
+		}
+
+		c.JSON(http.StatusOK, response)
 	})
 
-	// 登出（把 jti 加入黑名单）
+	// 登出
 	r.POST("/logout", func(c *gin.Context) {
 		tokenString, ok := extractBearer(c)
 		if !ok {
@@ -285,9 +464,7 @@ func main() {
 		c.JSON(http.StatusOK, gin.H{"message": "已登出"})
 	})
 
-	// ======= 服务端（游戏服/后端）调用的接口 =======
-
-	// 令牌校验（详细、带 openid），需要 X-Internal-Auth
+	// 服务端调用的接口
 	r.POST("/check-token", internalAuthMiddleware, func(c *gin.Context) {
 		var req CheckTokenRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -299,12 +476,12 @@ func main() {
 			c.JSON(http.StatusOK, gin.H{"valid": false, "reason": "invalid_token"})
 			return
 		}
-		// 黑名单 & 单点登录
 		if ok := isTokenUsable(c, claims); !ok {
 			c.JSON(http.StatusOK, gin.H{"valid": false, "reason": "revoked_or_kicked"})
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
+
+		response := gin.H{
 			"valid":      true,
 			"openid":     claims["sub"],
 			"user_id":    claims["user_id"],
@@ -314,10 +491,17 @@ func main() {
 			"exp":        claims["exp"],
 			"iat":        claims["iat"],
 			"jti":        claims["jti"],
-		})
+		}
+
+		// 如果JWT中有email声明，添加到响应中
+		if email, exists := claims["email"]; exists && email != nil {
+			response["email"] = email
+		}
+
+		c.JSON(http.StatusOK, response)
 	})
 
-	// 踢人：强制失效当前会话（单点登录机制），需要 X-Internal-Auth
+	// 踢人接口
 	r.POST("/sessions/kick", internalAuthMiddleware, func(c *gin.Context) {
 		var req KickRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -326,7 +510,7 @@ func main() {
 		}
 		var user User
 		if req.OpenID != "" {
-			if result := db.Where("open_id = ? OR openid = ?", req.OpenID, req.OpenID).First(&user); result.Error != nil {
+			if result := db.Where("openid = ?", req.OpenID).First(&user); result.Error != nil {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "用户不存在"})
 				return
 			}
@@ -339,7 +523,6 @@ func main() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "需要 openid 或 user_id"})
 			return
 		}
-		// 设置一个新的随机 session_id，旧 token 会失效
 		newSessionID := uuid.NewString()
 		if err := setCurrentSession(c, req.AppID, user.ID, newSessionID, time.Hour*24*7); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "踢人失败"})
@@ -359,7 +542,78 @@ func main() {
 	r.Run(":8081")
 }
 
-// ===== Helpers =====
+// ===== 邮箱验证相关函数 =====
+type RegistrationData struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+	AppID    string `json:"app_id"`
+}
+
+func storeEmailVerificationCode(email, code string, expiration time.Duration) error {
+	rdb := database.GetRedis()
+	return rdb.Set(context.Background(), emailVerificationKey(email), code, expiration).Err()
+}
+
+func validateEmailVerificationCode(email, code string) (bool, error) {
+	rdb := database.GetRedis()
+	storedCode, err := rdb.Get(context.Background(), emailVerificationKey(email)).Result()
+	if err != nil {
+		if err == redis.Nil {
+			return false, nil
+		}
+		return false, err
+	}
+	return storedCode == code, nil
+}
+
+func isEmailRateLimited(email string) bool {
+	rdb := database.GetRedis()
+	key := emailRateLimitKey(email)
+	exists, _ := rdb.Exists(context.Background(), key).Result()
+	return exists > 0
+}
+
+func setEmailRateLimit(email string, duration time.Duration) error {
+	rdb := database.GetRedis()
+	return rdb.Set(context.Background(), emailRateLimitKey(email), "1", duration).Err()
+}
+
+func storeRegistrationData(email string, data RegistrationData, expiration time.Duration) error {
+	rdb := database.GetRedis()
+	key := registrationDataKey(email)
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	return rdb.Set(context.Background(), key, jsonData, expiration).Err()
+}
+
+func getRegistrationData(email string) (RegistrationData, error) {
+	rdb := database.GetRedis()
+	key := registrationDataKey(email)
+	data, err := rdb.Get(context.Background(), key).Bytes()
+	if err != nil {
+		return RegistrationData{}, err
+	}
+	var regData RegistrationData
+	err = json.Unmarshal(data, &regData)
+	return regData, err
+}
+
+func clearRegistrationData(email string) {
+	rdb := database.GetRedis()
+	key := registrationDataKey(email)
+	rdb.Del(context.Background(), key)
+	// 同时清理验证码
+	rdb.Del(context.Background(), emailVerificationKey(email))
+}
+
+func sendVerificationEmail(email, code string) {
+	// 在实际应用中，这里应该调用邮件服务API
+	log.Printf("向邮箱 %s 发送验证码: %s", email, code)
+}
+
+// ===== 辅助函数 =====
 func internalAuthMiddleware(c *gin.Context) {
 	if internalSharedToken == "" {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "服务端共享密钥未配置"})
@@ -421,7 +675,6 @@ func parseAndValidateClaims(tokenString string) (jwt.MapClaims, error) {
 	if !ok {
 		return nil, errors.New("invalid claims")
 	}
-	// 过期校验（jwt.Parse 已做，但这里稳妥检查）
 	if exp, ok := claims["exp"].(float64); ok {
 		if time.Now().After(time.Unix(int64(exp), 0)) {
 			return nil, errors.New("expired")
@@ -436,7 +689,6 @@ func isTokenUsable(c *gin.Context, claims jwt.MapClaims) bool {
 	if isBlacklisted(ctx, jti) {
 		return false
 	}
-	// 单点登录校验：token.session_id 必须等于 Redis 中当前 session_id
 	appID := fmt.Sprint(claims["app_id"])
 	userIDAny := claims["user_id"]
 	var userID uint
@@ -473,24 +725,35 @@ func checkPasswordHash(password, hash string) bool {
 
 func generateJWT(user User, appID string, sessionID string) (string, string, error) {
 	jti := uuid.NewString()
-	exp := time.Now().Add(7 * 24 * time.Hour) // 7天
+	exp := time.Now().Add(7 * 24 * time.Hour)
 	claims := jwt.MapClaims{
-		"sub":        user.OpenID, // openid
+		"sub":        user.OpenID,
 		"user_id":    user.ID,
 		"username":   user.Username,
 		"app_id":     appID,
-		"session_id": sessionID, // 单点登录关键字段
-		"jti":        jti,       // 令牌ID，用于黑名单
+		"session_id": sessionID,
+		"jti":        jti,
 		"exp":        exp.Unix(),
 		"iat":        time.Now().Unix(),
 	}
+
+	// 只有当邮箱不为 nil 时才添加到声明中
+	if user.Email != nil {
+		claims["email"] = *user.Email
+	}
+
 	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
 	signed, err := token.SignedString(jwtSecret)
 	return signed, jti, err
 }
 
-// ========= 下面是短信/手机号登录相关与你原来的逻辑一致（略有小改：生成 openid & 单点登录） =========
+func isValidEmail(email string) bool {
+	pattern := `^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$`
+	matched, _ := regexp.MatchString(pattern, email)
+	return matched
+}
 
+// ===== 短信/手机号登录相关 =====
 type SMSCode struct {
 	Code        string    `json:"code"`
 	CountryCode string    `json:"country_code"`
@@ -718,7 +981,7 @@ func phoneLoginHandler(db *gorm.DB) gin.HandlerFunc {
 		ClearSMSCode(req.CountryCode, req.Phone)
 		ClearLoginAttempts(req.CountryCode, req.Phone)
 
-		c.JSON(http.StatusOK, gin.H{
+		response := gin.H{
 			"message": "登录成功",
 			"token":   token,
 			"openid":  user.OpenID,
@@ -729,7 +992,14 @@ func phoneLoginHandler(db *gorm.DB) gin.HandlerFunc {
 				"country_code": user.CountryCode,
 			},
 			"jti": jti,
-		})
+		}
+
+		// 如果有邮箱，添加到响应中
+		if user.Email != nil {
+			response["user"].(gin.H)["email"] = *user.Email
+		}
+
+		c.JSON(http.StatusOK, response)
 	}
 }
 
@@ -745,6 +1015,7 @@ func findOrCreateUserByPhone(db *gorm.DB, countryCode, phone string) (*User, err
 				CountryCode:   countryCode,
 				Phone:         normalizedPhone,
 				PhoneVerified: true,
+				Email:         nil, // 手机号注册的用户邮箱为 NULL
 				CreatedAt:     time.Now(),
 				UpdatedAt:     time.Now(),
 			}
@@ -759,7 +1030,7 @@ func findOrCreateUserByPhone(db *gorm.DB, countryCode, phone string) (*User, err
 		db.Model(&user).Update("phone_verified", true)
 	}
 	if user.OpenID == "" {
-		db.Model(&user).Update("open_id", uuid.NewString())
+		db.Model(&user).Update("openid", uuid.NewString())
 	}
 	return &user, nil
 }

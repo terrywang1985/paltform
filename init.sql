@@ -9,10 +9,11 @@ CREATE TABLE IF NOT EXISTS users (
     openid CHAR(36) UNIQUE NOT NULL,
     username VARCHAR(100) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
-    email VARCHAR(255) UNIQUE NOT NULL,
+    email VARCHAR(255) NULL UNIQUE,  -- 允许 NULL 但保持唯一性
     phone VARCHAR(20),
     country_code VARCHAR(5) DEFAULT '+86',
     phone_verified BOOLEAN DEFAULT FALSE,
+    email_verified BOOLEAN DEFAULT FALSE,  -- 新增邮箱验证状态字段
     first_name VARCHAR(100),
     last_name VARCHAR(100),
     avatar VARCHAR(255),
